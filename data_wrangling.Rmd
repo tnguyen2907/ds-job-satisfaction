@@ -1,0 +1,276 @@
+---
+title: "Data Wrangling"
+author: "Trung Nguyen, Dat Le"
+date: "2024-04-04"
+output: pdf_document
+---
+## 2) Data cleaning
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE) 
+```
+After a great deal of data transforming and filtering, we arrive at the final dataset with 337 rows and 14 columns. The details of the final dataset are at the bottom of the file.
+
+Details for our data cleaning process is as follow:
+```{r}
+library(tidyverse)
+library(fuzzyjoin)
+```
+
+We started by joining three tables from three csv files: companies.csv, employee_counts.csv, and company_industries.csv to get a dataset with company_id, name, industry, employee_count, state, country, and city. 
+
+Each row in this dataframe is a company.
+
+Since there are different employee counts for the same company_id because the data was scraped multiple times, we group by company_id and select the first row for each company_id.
+
+```{r}
+#Join companies and employee_counts and industries
+companies <- read_csv("data/companies.csv")
+employee_counts <- read_csv("data/employee_counts.csv")
+industries <- read_csv("data/company_industries.csv")
+
+companies_join_employee_counts_join_industries <- companies %>%
+  left_join(employee_counts, by = c("company_id" = "company_id")) %>% 
+  left_join(industries, by = c("company_id" = "company_id")) %>%
+  group_by(company_id) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(company_id, name, industry, employee_count, state, country, city)
+```
+
+After some initial analysis, we found that the majority of the rows have country = "US". The proportion of each of the remaining countries are in significant, so we decided to group all non-US countries into one category called "non_US".
+```{r}
+companies_join_employee_counts_join_industries <- companies_join_employee_counts_join_industries %>% 
+  mutate(country = ifelse(country != "US", "non_US", country))
+```
+
+
+Then we joined two tables from two csv files: job_postings.csv and benefits.csv to get a dataset with company_id, max_salary, med_salary, min_salary, pay_period, remote_allowed, and benefit_count. 
+
+Each row in this dataframe is a job posting.
+
+Since each job can have multiple benefits, we group by job_id and count the number of benefits for each job. 
+
+Moreover, we filter out all the rows with currency not in USD.
+```{r}
+# Join job_postings and benefits
+job_postings <- read.csv('data/job_postings.csv')
+benefits <- read.csv('data/benefits.csv')
+
+job_postings_join_benefits <- job_postings %>%
+  left_join(benefits, by = c("job_id" = "job_id")) %>%
+  group_by(job_id) %>%
+  mutate(benefit_count = sum(!is.na(type))) %>% 
+  slice(1) %>%
+  ungroup() %>%
+  filter(currency == "USD") %>%
+  select(company_id, max_salary, med_salary, min_salary, pay_period, remote_allowed, benefit_count)
+
+```
+
+
+Finally, we joined the above two datasets to get a dataset with company_id, name, industry, employee_count, company_size, state, country, city, max_salary, med_salary, min_salary, pay_period, remote_allowed, and benefit_count. 
+
+Each row in this dataframe is a job posting with company information.
+```{r}
+# Join the above two to get linkedin dataset
+linkedin <- job_postings_join_benefits %>%
+  left_join(companies_join_employee_counts_join_industries, by = c("company_id" = "company_id"))
+```
+
+```{r}
+linkedin %>%  glimpse()
+```
+
+```{r}
+linkedin %>% is.na() %>% colSums()
+```
+
+At this point, we perform a few initial data cleaning steps:
+
+- Drop rows with NA in company_id
+
+- Drop rows with pay_period = "ONCE", remaining rows are "HOURLY", "WEEKLY", "MONTHLY", "YEARLY"
+
+- Calculate salary as the mean of min_salary, med_salary, and max_salary for each row using mean. We then normalize the salary based on the pay_period.
+
+- Replace NA in remote_allowed with 0
+
+- Drop NA in employee_count
+```{r}
+#company_id
+linkedin <- linkedin %>% drop_na(company_id)
+
+#salary
+
+#Drop rows with pay_period = "ONCE", remaining rows are "HOURLY", "WEEKLY", "MONTHLY", "YEARLY"
+linkedin <- linkedin %>% filter(pay_period != "ONCE")
+# Calculate salary as the mean of min_salary, med_salary, and max_salary for each row using mean
+linkedin <- linkedin %>% 
+  mutate(salary = rowMeans(select(., min_salary, med_salary, max_salary), na.rm = TRUE)) %>% 
+  mutate(salary = case_when(
+    pay_period == "HOURLY" ~ salary * 8 * 5 * 52,
+    pay_period == "WEEKLY" ~ salary * 52,
+    pay_period == "MONTHLY" ~ salary * 12,
+    pay_period == "YEARLY" ~ salary
+  )) %>%
+  drop_na(salary) %>%
+  select(-min_salary, -med_salary, -max_salary, -pay_period)
+
+#remote_allowed NA to 0
+linkedin <- linkedin %>% 
+  mutate(remote_allowed = ifelse(is.na(remote_allowed), 0, remote_allowed))
+
+#Drop na in employee_count
+linkedin <- linkedin %>% drop_na(employee_count)
+
+linkedin %>%  glimpse()
+```
+
+Since our study subject is companiy, we collapse all rows that have the same company_id into one row using group by. In the group by aggregation, we calculate the average salary and average benefit count of each company.
+
+
+```{r}
+linkedin_companies <- linkedin %>% 
+  group_by(company_id) %>% 
+  mutate(
+    avg_salary = mean(salary, na.rm = TRUE),
+    avg_benefit_count = mean(benefit_count, na.rm = TRUE),
+    ) %>% 
+  slice(1) %>%
+  ungroup()
+
+linkedin_companies %>% glimpse()
+```
+
+Next, we read the ambition_box.csv, which has response variable rating and few other explanatory variables
+```{r}
+companies_reviews <- read.csv('data/ambition_box.csv')
+```
+
+We need to join these two dataframe together on the company name. Since the company names in each dataset are different, we need to match them using this approach: Given two company names a and b, they are considered a match if a is a word of b or b is a word of a. We use the fuzzyjoin package to perform this join.
+
+```{r, cache = TRUE}
+# Perform the fuzzy join. May take 30 minutes
+match_fun <- function(x, y) {
+  mapply(function(a, b) grepl(paste0("\\b", a, "\\b"), b, ignore.case = TRUE), x, y) |
+    mapply(function(a, b) grepl(paste0("\\b", a, "\\b"), b, ignore.case = TRUE), y, x)
+}
+
+linkedin_join_reviews <- fuzzy_join(linkedin_companies, companies_reviews,
+                        by = c("name" = "Company.name"),
+                        match_fun = match_fun,
+                        mode = "left")
+
+linkedin_join_reviews_filtered<- linkedin_join_reviews %>% filter(!is.na(Reviews)) %>% 
+  group_by(name) %>%
+  slice(1) %>%
+  ungroup() %>% 
+  select(company_id, name, Company.name, industry, employee_count, remote_allowed, state, country, city, avg_salary, avg_benefit_count, Company.type, Old, Reviews, Rating)
+```
+
+We then do some additional data cleaning:
+- Extract the number of years from the Old column, which is in the format "x years old". Remove rows with ""
+- Extract the number of reviews from the Reviews column, which is in the format "x Reviews". If "k" is present, multiply by 1000. Remove rows with ""
+
+```{r}
+# Extract the number of years from the Old column
+linkedin_join_reviews_filtered <- linkedin_join_reviews_filtered %>% 
+  mutate(Old = as.integer(gsub(" years old", "", Old)))
+
+linkedin_join_reviews_filtered <- linkedin_join_reviews_filtered %>% 
+  filter(Old != "")
+
+#Extract the number of reviews from the Reviews column
+linkedin_join_reviews_filtered <- linkedin_join_reviews_filtered %>% 
+  mutate(Reviews = gsub(" Reviews", "", Reviews)) %>% 
+  #End with k means multiply by 1000
+  mutate(Reviews = case_when(
+    str_detect(Reviews, "k") ~ as.numeric(gsub("k", "", Reviews)) * 1000,
+    TRUE ~ as.numeric(Reviews)
+  ))
+
+linkedin_join_reviews_filtered <- linkedin_join_reviews_filtered %>% 
+  filter(Reviews != "")
+
+linkedin_join_reviews_filtered %>% glimpse()
+```
+
+Export the dataset to csv for manual data cleaning
+```{r}
+#Export to csv
+# write_csv(linkedin_join_reviews_filtered, "data/linkedin_join_reviews_filtered.csv")
+```
+
+At this point, we manually go through each row and remove the ones whose company names are not a good match. Moreover, we change the "&" symbol into "and" to collapse some unnecessary categories.
+
+The modified dataset is stored in linkedin_join_reviews_filtered_manually.csv. 
+
+
+```{r}
+linkedin_join_reviews_filtered_manually <- read_csv("data/linkedin_join_reviews_filtered_manually.csv")
+```
+
+We then normalize the state column by replacing the abbreviation with the full name of the state. The reason for doing this at the end is that there are less edge cases after we have done all the filtering.
+```{r}
+abbrevitation <- c('AL', 'AK', 'AZ', 'AR', 'AS', 'CA', 'CO', 'CT', 'DE', 'DC', 'FL', 'GA', 'GU', 'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD', 'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ', 'NM', 'NY', 'NC', 'ND', 'MP', 'OH', 'OK', 'OR', 'PA', 'PR', 'RI', 'SC', 'SD', 'TN', 'TX', 'TT', 'UT', 'VT', 'VA', 'VI', 'WA', 'WV', 'WI', 'WY', 'Tx', 'Va')
+full_name <- c('Alabama', 'Alaska', 'Arizona', 'Arkansas', 'American Samoa', 'California', 'Colorado', 'Connecticut', 'Delaware', 'District of Columbia', 'Florida', 'Georgia', 'Guam', 'Hawaii', 'Idaho', 'Illinois', 'Indiana', 'Iowa', 'Kansas', 'Kentucky', 'Louisiana', 'Maine', 'Maryland', 'Massachusetts', 'Michigan', 'Minnesota', 'Mississippi', 'Missouri', 'Montana', 'Nebraska', 'Nevada', 'New Hampshire', 'New Jersey', 'New Mexico', 'New York', 'North Carolina', 'North Dakota', 'Northern Mariana Islands', 'Ohio', 'Oklahoma', 'Oregon', 'Pennsylvania', 'Puerto Rico', 'Rhode Island', 'South Carolina', 'South Dakota', 'Tennessee', 'Texas', 'Trust Territories', 'Utah', 'Vermont', 'Virginia', 'Virgin Islands', 'Washington', 'West Virginia', 'Wisconsin', 'Wyoming', 'Texas', 'Virginia')
+
+abbrev_to_full <- list()
+
+for (i in seq_along(abbrevitation)) {
+  abbrev_to_full[[abbrevitation[i]]] <- full_name[i]  # Assign each value to its corresponding key
+}
+abbrev_to_full <- unlist(abbrev_to_full)
+
+linkedin_join_reviews_filtered_manually <- linkedin_join_reviews_filtered_manually %>%
+  mutate(state = str_replace_all(state, pattern = abbrev_to_full))
+```
+
+Finally, we rename the columns for consistency and remove the Company.name column.
+```{r}
+final_dataset <- linkedin_join_reviews_filtered_manually %>% 
+  select(-Company.name) %>%
+  rename(
+    company_type = Company.type,
+    company_age = Old,
+    num_reviews = Reviews,
+    rating = Rating
+  )
+
+final_dataset %>% glimpse()
+```
+
+
+```{r}
+#Export to csv
+# write_csv(final_dataset, "data/final_dataset.csv")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
